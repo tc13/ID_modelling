@@ -2,7 +2,7 @@
 title: "Forecasting an Epidemic"
 subtitle: "Migrant worker COVID-19 dormitory outbreak, Singapore 2020"
 author: "Thomas Crellen, Saw Swee Hock School of Public Health"
-date: "09 September 2026  (SPH5421, Week 7)"
+date: "28 September 2026  (SPH5421, Week 7)"
 output:
   html_document:
     toc: true
