@@ -1,0 +1,777 @@
+---
+title: "Forecasting an Epidemic"
+subtitle: "Migrant worker COVID-19 dormitory outbreak, Singapore 2020"
+author: "Thomas Crellen, Saw Swee Hock School of Public Health"
+date: "09 September 2026  (SPH5421, Week 7)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE, eval=T, warning=F, message=F}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache=T,
+                      fig.width = 8, fig.height = 5)
+set.seed(666)
+# odin is used for the SEIR model. If unavailable, see the note in Section 4.
+#options(repos = c(CRAN = "https://r-project.org"))
+#utils::install.packages("odin")
+require(odin)   # uncomment if installed
+require(lubridate)
+
+## Run odin here
+seir_ode <- odin({
+  deriv(S) <- -beta * S * I
+  deriv(E) <-  beta * S * I - lambda * E
+  deriv(I) <-  lambda * E   - gamma  * I
+  deriv(R) <-  gamma * I
+
+  initial(S) <- N_ini - I_ini
+  initial(I) <- I_ini
+  initial(R) <- 0
+  initial(E) <- 0
+
+  N_ini  <- user()
+  I_ini  <- user()
+  beta   <- user()
+  gamma  <- user()
+  lambda <- user()
+})
+
+```
+
+# Introduction: forecasting during an outbreak {#intro}
+
+In the early months of the COVID-19 pandemic in 2020, Singapore experienced rising case numbers, reaching a cumulative total of 4,000 by mid-April. This was driven by i) cases in the general population, ii) importations from abroad, and iii) transmission in foreign worker dormitories. 
+
+A modelling expert at NUS made [a bold claim](https://www.straitstimes.com/singapore/total-cases-could-hit-40000-this-month-experts), that within a few weeks the total number of cases in Singapore would rise to 10,000--20,000. This expected rise was primarily due to an outbreak occurring among migrant workers living in crowded, communal living environments. Cases in migrant worker dormitories took off as the major source of new infections as Singapore went into lockdown, and is the focus of this exercise.
+
+Forecasting short-term behaviour of an emerging epidemic is key to preparing resources and developing an appropriate public health response. However, modelling in real time is much harder than retrospectively fitting a compartmental model to data.
+
+Imagine you are a public health analyst during this outbreak.
+You have observed case counts **up to mid-April**, and you are being
+asked two questions:
+
+1.  *How fast is this epidemic growing, and what is driving the speed of growth?*
+2.  *What will happen next — how many cases should we prepare for?*
+
+This activity walks through how a modeller answers these questions. We
+will:
+
+- start with a simple, hand-tuned **exponential growth** curve to build
+  intuition;
+- fit a mechanistic **SEIR** model to the data using a **Metropolis
+  (MCMC)** algorithm, which gives a full description of our *uncertainty*;
+- use the fitted model to make **probabilistic forecasts**;
+- confront those forecasts with **new data** that arrives later
+  — the real test of any prediction;
+- we will then update our forecasts using the new data.
+
+> **Learning objectives** By the end of this class you should be able to 
+> (i) use different metrics to quantify the growth of epidemics,
+> (ii) understand and describe in plain language how parameter choices are made by the Metropolis algorithm and intepret the ouput,
+> (iii) use parameter estimates to make forecasts of future cases,
+> (iv) consider why the model and data diverge, and how the transmission model can be amended.
+
+------------------------------------------------------------------------
+
+# R setup
+
+Ensure you have migrated to the folder where you can access the data.
+
+Load (and, if necessary, install) the following packages:
+
+```{r packages, eval=F}
+library(odin)
+library(lubridate)
+```
+
+# The data {#data}
+
+We begin with the COVID-19 case counts observed up to mid-April 2020 from dormitories.
+
+```{r data-load}
+T0 <- dmy("16-03-2020") # Date at the start of the epidemic
+
+# ---------------------------------------------------------------------------
+datasofar      <- read.csv("data/data-01-midapril.csv")
+datasofar$time <- as.numeric(as.Date(datasofar$date,format="%d/%m/%Y")-T0)
+datasofar$date <- dmy(datasofar$date)
+
+#   Column descriptions
+
+#   date        : Calendar date
+#   time        : day (numeric, e.g. days since start of outbreak)
+#   cases_dorms : New cases reported that day (incidence)
+```
+
+## Plotting incidence and cumulative cases
+
+It is always worth looking at case data in two ways. *Incidence* (new
+cases per day) shows the tempo of the epidemic; *cumulative* cases show
+the total burden and are often smoother.
+
+```{r data-plot, fig.width=10, fig.height=4.5}
+par(mfrow = c(1, 2), mar=c(5,5,2,1))
+
+# Incidence
+plot(datasofar$date, datasofar$cases_dorms, type = "h", lwd = 2,
+     col = "steelblue",
+     cex.lab = 1.2,
+     xlab = "Date (2020)", ylab = "New cases per day",
+     main = "Observed incidence")
+points(datasofar$date, datasofar$cases, pch = 19, col = "steelblue")
+
+# Cumulative
+plot(datasofar$date, cumsum(datasofar$cases_dorms), type = "o", pch = 19,
+     col = "darkred",
+     cex.lab = 1.2,
+     xlab = "Date (2020)", ylab = "Cumulative cases",
+     main = "Observed cumulative cases")
+```
+
+> **Discussion prompt.** Which of these two views makes the *growth* of
+> the epidemic easier to judge by eye? Which is more affected by
+> day-to-day reporting noise?
+
+------------------------------------------------------------------------
+
+# A manually tuned exponential curve {#exponential}
+
+Before any fancy fitting, let us try to describe the data with the
+simplest possible growth model and a couple of parameters we choose values for *by
+hand*. This builds some intuition for what the parameters mean and how optimisation works.
+
+The two quantities we are estimating in our model are $R_0$ and $I_0$. 
+
+$R_0$ is the basic reproduction number, which we have encountered several times already in this course. For a directly transmissed pathogen, such as SARS-CoV-2, it is defined as the expected number of secondary cases arising from a primary case in a fully susceptible host population. 
+
+$I_0$ is simply the number of infectious people at the start of the epidemic (at our first time point -- in this case 16 March 2020).
+
+Other parameters in our model, such as the duration of the latent $(\lambda^{-1})$ and infectious $(\gamma^{-1})$ periods, are treated as fixed values.
+
+## From R0 to a growth rate
+
+Early in an epidemic, cases grow roughly exponentially,
+$C(t) = I_0 e^{rt}$, where $r$ is the **growth rate** (per day). Our
+transmission model is an SEIR with a latent period (mean $1/\lambda$) and
+an infectious period (mean $1/\gamma$). For such a model, the
+reproduction number $R_0$ and the growth rate $r$ are linked by
+
+$$\left(1 + \frac{r}{\lambda}\right)\left(1 + \frac{r}{\gamma}\right) = R_0,$$
+
+which we can solve for $r$:
+
+$$r = \frac{-(\lambda+\gamma) + ((\lambda-\gamma)^2 + 4\lambda\gamma R_0)^{1/2}}{2}.$$
+
+```{r r-from-R0}
+# Fixed natural-history parameters
+lambda <- 0.5    # 1 / latent period   -> mean latent period = 2 days
+gamma  <- 0.14   # 1 / infectious period -> mean infectious period ~ 7.1 days
+
+# Function to get daily growth rate from R0
+growth_rate <- function(R0, lambda = 0.5, gamma = 0.14) {
+  ( -(lambda + gamma) +
+      sqrt((lambda - gamma)^2 + 4 * lambda * gamma * R0) ) / 2
+}
+
+# Sanity check
+r_example <- growth_rate(2.5)
+cat("R0 = 2.5  ->  r =", round(r_example, 3), " growth per day\n")
+cat("Doubling time =", round(log(2) / r_example, 2), "days\n")
+```
+
+> **Note.** The calculation of the growth rate $r$ above depends on the *shape*
+> of the generation interval, not just the mean, which the SEIR structure specifies
+> exactly.
+
+## Expected incidence under exponential growth
+
+The exponential growth of any quantity is given by $e^{rt}$, however this is a continuous time formulation. As our daily **incidence** is discrete, (new cases counted between day $t-1$ and day $t$), we calculate our expected new daily cases with a slight modification.
+
+$$\text{incidence}(t) = I_0\, e^{r t}\,(1 - e^{-r}).$$
+
+```{r exp-incidence-fn}
+expected_incidence <- function(R0, I0, times,
+                               lambda = 0.5, gamma = 0.14,
+                               discrete = TRUE) {
+  r <- growth_rate(R0, lambda, gamma)
+   
+  if (discrete) {
+    I0 * exp(r * times) * (1 - exp(-r))   # new cases per day
+  } else {
+    r * I0 * exp(r * times)               # instantaneous dC/dt
+  }
+}
+```
+
+## Try it: choose $R_0$ and $I_0$ by hand
+
+Adjust `R0_guess` and `I0_guess` and see how the curve moves. Try to
+eyeball a good fit — this manually approximates what the Metropolis algorithm will do later. 
+
+> **Stop and think.**
+> Below we have guessed values for $R_0$ and $I_0$.
+>
+> - Can you find parameter values that fit the data better?
+> - Write down your best estimates of $R_0$ and $I_0$.
+
+```{r exp-plot, fig.width=9, fig.height=5}
+## Initial guesses for the parameters
+R0_guess <- 2.5
+I0_guess <- 10
+
+tt   <- datasofar$time
+pred_inc <- expected_incidence(R0_guess, I0_guess, tt)
+
+plot(tt, datasofar$cases_dorms, pch = 19, col = "steelblue",
+     xlab = "Day", ylab = "New cases per day",
+     main = sprintf("Hand-tuned exponential fit (R0 = %.2f, I0 = %.0f)",
+                    R0_guess, I0_guess))
+lines(tt, pred_inc, col = "darkorange", lwd = 2, lty=2)
+legend("topleft", c("Observed", "Exponential model"),
+       col = c("steelblue", "darkorange"), pch = c(19, NA), lwd = c(NA, 2),
+       lty=c(NA, 2), bty = "n")
+```
+
+> **This line is already a prediction.** If you extend `tt` beyond the
+> observed range, the same curve forecasts future incidence. But which
+> values for $R_0$ and $I_0$ are *best*, and how confident should we be in our estimate?
+
+------------------------------------------------------------------------
+
+## The transmission model
+
+A limitation of using an exponential curve to describe an outbreak is that it is unable to account for the depletion of susceptible hosts and the rise of herd immunity, as individuals within the population recover from infection. To model these effects, we turn again to **compartmental models**, which you have already encountered in this course.
+
+> **Activity.** 
+> To aid your understanding, draw out a diagram of the susceptible--exposed--infected--recovered (SEIR) model below.
+> What key assumptions have been made?
+
+```{r seir-ode, eval=F, message = F, warning = F}
+seir_ode <- odin({
+  deriv(S) <- -beta * S * I
+  deriv(E) <-  beta * S * I - lambda * E
+  deriv(I) <-  lambda * E   - gamma  * I
+  deriv(R) <-  gamma * I
+
+  initial(S) <- N_ini - I_ini
+  initial(I) <- I_ini
+  initial(R) <- 0
+  initial(E) <- 0
+
+  N_ini  <- user()
+  I_ini  <- user()
+  beta   <- user()
+  gamma  <- user()
+  lambda <- user()
+})
+```
+
+```{r run-seir-1, eval=T, message = F, warning = F}
+
+runSEIR <- function(inputpars, timevec = NULL) {
+  if (is.null(timevec)) stop("No time window provided for model run")
+  parameters <- list(beta = NA, lambda = 0.5, gamma = 0.14, n = 323000)
+  parameters$beta <- inputpars$R0 * parameters$gamma / parameters$n
+
+  seir_mod <- seir_ode$new(beta = parameters$beta,
+                           gamma = parameters$gamma,
+                           lambda = parameters$lambda,
+                           N_ini = parameters$n,
+                           I_ini = inputpars$I0)
+  as.data.frame(seir_mod$run(timevec))
+}
+```
+
+
+# Fitting with the Metropolis algorithm {#mcmc}
+
+Choosing parameters by eye is subjective. We now use an algorithm to choose the parameters that best fit the dataset and quantify how *uncertain* those choices are. We do
+this using **Markov chain Monte Carlo (MCMC)**, via the **Metropolis**
+algorithm.
+
+## What is MCMC doing?
+
+Think of the space of possible parameter pairs $(R_0, I_0)$ as a hilly landscape. The **height** at each point is how well those parameters explain the data (combined with any prior beliefs) — giving the *posterior*. We want to map this landscape, and find the highest points for each parameter.
+
+The **Metropolis** algorithm uses a simple rule for a walker exploring the topography:
+
+1.  From the current point, **propose** a nearby random step.
+2.  Compute how the posterior height changes.
+3.  If the proposal is **higher**, always move there.
+4.  If it is **lower**, move there only *sometimes* — with a probability
+    equal to the ratio of the two heights.
+
+That last rule is critical: by *occasionally* accepting worse moves, the walker avoids getting trapped in local maxima and, over many steps, **visits each region in proportion to its posterior probability**. The collection of
+visited points — the *chain* — is then a sample from the posterior distribution.
+
+> **Why not just find the single best point?** Because a good forecast
+> needs *uncertainty*. The spread of the chain tells us the range of
+> parameter values that are consistent with the data.
+
+**Further accessible reading on this topic:**
+
+- Chapter on MCMC in *Statistical Rethinking* textbook by [Richard McElreath](https://xcelab.net/rm/) for a helpful,
+  code-first treatment.
+- Hamra, Richardson & MacLehose (2013), *Markov Chain Monte Carlo: an
+  introduction for epidemiologists*, International Journal of
+  [Epidemiology](https://doi.org/10.1093/ije/dyt043).
+- van Ravenzwaaij, Cassey & Brown (2018), *A simple introduction to
+  Markov chain Monte–Carlo sampling*, Psychonomic Bulletin & [Review](https://link.springer.com/article/10.3758/s13423-016-1015-8).
+
+## Likelihood function
+
+The observed **daily incidence** is a count variable (i.e. a whole number or integer). The appropriate statistical distribution for counts is usually a **Poisson** model. In our case, this assumes Poisson distributed error around our predicted number of new cases. The Poisson likelihood model is simple as it only uses one parameter, the **rate** which gives both the expected mean and variance. As this is often too restrictive, some models use a **negative binomial** function, which allows for greater variance between the predicted mean and the observed values and introduces another parameter.
+
+The below code gives a function for evaluating the log--likelihood of our model (i.e. a measure of how well our parameter values predict the observed cases). The key line here is `sum(dpois(obs_inc, lambda = model_inc, log = TRUE))`.
+
+As this is a Bayesian analysis, we must also place **prior distributions** on the parameters we wish to estimate. For this analysis, we use only mildly informative priors that will not greatly influence the final values. 
+
+The model output from the MCMC process is a **posterior distribution** for each estimated parameter (in our case for $R_0$ and $I_0$). This requires linking the prior distribution with the likelihood, as is done below in `log_posterior`.
+
+```{r mcmc-functions, eval=T}
+log_likelihood <- function(pars, inputdata) {
+  R0 <- as.numeric(pars$R0)[1]; I0 <- as.numeric(pars$I0)[1]
+  seirfit   <- runSEIR(list(R0 = R0, I0 = I0), inputdata$time)
+  model_cum <- seirfit$I + seirfit$R  ## counting daily incidence
+  model_inc <- pmax(diff(c(0, model_cum)), 1e-9)   # performs an offset with the day before
+  obs_inc   <- inputdata$cases
+  sum(dpois(obs_inc, lambda = model_inc, log = TRUE))
+}
+
+log_prior <- function(pars) {
+  if (pars$R0 <= 1) return(-Inf)   # outbreak assumed to be growing
+  if (pars$I0 <  0) return(-Inf)
+  dnorm(pars$R0, mean = 2, sd = 1, log = TRUE) +
+    dexp(pars$I0, rate = 0.1,      log = TRUE)
+}
+
+log_posterior <- function(pars, inputdata) {
+  lp <- log_prior(pars)
+  if (!is.finite(lp)) return(-Inf)
+  lp + log_likelihood(pars, inputdata)
+}
+```
+
+## The sampler
+The Metropolis sampler performs what we described earlier as a 'walk' through a hilly landscape (i.e. parameter space). 
+
+Another analogy is a very drunk person staggering around, trying to find the liveliest part of the city. However, they can only **propose** one random step at a time. After proposing a step, they either accept, if it seems that this step will take then closer to a more exciting area, or reject the step if the new direction seems too quiet. Sometimes, though, we need to take **worse** steps to escape from a middling neighbourhood (a local maxima) to finally make it to the best spot in town (global maxima).
+
+It is important to note that a lot of code is given below -- **you do not need to understand every line!** Often when modellers run these kind of fitting algorithms, they use packages that condense a lot of this. Here, we have written out the **entire Metropolis algorithm**. While this is more technical, it gives some intuition for how the statistical apparatus is working 'under the hood'.
+
+```{r mcmc-sampler, eval=T}
+metropolis_sampler <- function(R0 = 2, I0 = 1,
+                               iter = 10000,
+                               burnin = 5000,
+                               thin = 1,
+                               proposal_sd = c(R0 = 0.05, I0 = 0.2),
+                               seed = 666,
+                               inputdata = datasofar)
+{
+  trainingdata <- data.frame(time  = inputdata$time,
+                             cases = inputdata$cases_dorms)
+  
+  set.seed(seed)
+  
+  ## Check
+  if (burnin >= iter)
+    stop("burnin (", burnin, ") must be smaller than iterations (",
+         iter, "). Increase inter or reduce burnin.")
+  
+  parsNow <- list(R0 = R0, I0 = I0)
+  logpNow <- log_posterior(parsNow, trainingdata)
+  if (!is.finite(logpNow))
+    stop("Initial parameters have zero posterior density; choose legal starting values.")
+  
+  # Storage for the full chain
+  chain <- data.frame(R0 = numeric(iter),
+                      I0 = numeric(iter),
+                      logpost = numeric(iter))
+  
+  n_accept <- 0L
+  
+  for (iteration in 1:iter)
+  {
+    if (iteration %% 1000 == 0)
+      cat("Iteration", iteration, "of", iter,
+          "| acceptance so far:",
+          round(n_accept / iteration, 3), "\n")
+    
+    # --- Propose (symmetric Gaussian random walk) ---
+    parsProp <- parsNow
+    parsProp$R0 <- rnorm(1, parsNow$R0, proposal_sd["R0"])
+    parsProp$I0 <- rnorm(1, parsNow$I0, proposal_sd["I0"])
+    
+    logpProp <- log_posterior(parsProp, trainingdata)
+    
+    # --- Metropolis acceptance (symmetric proposal => ratio only) ---
+    log_accept_ratio <- logpProp - logpNow
+    if (log(runif(1)) < log_accept_ratio) {
+      parsNow  <- parsProp
+      logpNow  <- logpProp
+      n_accept <- n_accept + 1L
+    }
+    
+    chain$R0[iteration]      <- parsNow$R0
+    chain$I0[iteration]      <- parsNow$I0
+    chain$logpost[iteration] <- logpNow
+  }
+  
+  acceptance_rate <- n_accept / iter
+  cat("\nFinal acceptance rate:", round(acceptance_rate, 3), "\n")
+  
+  # --- Post-process: discard burn-in, then thin ---
+  keep      <- seq(from = burnin + 1, to = iter, by = thin)
+  posterior <- chain[keep, ]
+
+  # --- Posterior summaries ---
+  summarise <- function(x)
+    c(mean    = mean(x),
+      median  = median(x),
+      sd      = sd(x),
+      `2.5%`  = unname(quantile(x, 0.025)),
+      `50%`   = unname(quantile(x, 0.5)),
+      `97.5%` = unname(quantile(x, 0.975)))
+  
+  post_summary <- rbind(R0 = summarise(posterior$R0),
+                        I0 = summarise(posterior$I0))
+  
+  # Return everything useful
+  invisible(list(posterior       = posterior,   # thinned, post-burn-in draws
+                 chain           = chain,        # full raw chain
+                 summary         = post_summary,
+                 acceptance_rate = acceptance_rate,
+                 settings        = list(iter = iter,
+                                        burnin = burnin,
+                                        thin   = thin,
+                                        proposal_sd = proposal_sd,
+                                        seed   = seed)))
+}
+```
+
+```{r run-sampler, eval=T}
+# Run the sampler:
+post <- metropolis_sampler(R0 = 2.5,
+                           I0 = 10,
+                           iter = 10000, 
+                           burnin = 5000,
+                           inputdata = datasofar)
+```
+
+> **Tuning tip.** Aim for an acceptance rate around **0.2–0.4**. 
+> Too low -\> reduce `proposal_sd`; too high -\> enlarge it.
+
+------------------------------------------------------------------------
+
+# Assessing the chains and posteriors {#diagnostics}
+
+Never trust an MCMC run without looking at the output! Here are two checks:
+
+1.  **Trace plots** should look like fuzzy horizontal "caterpillars"
+    after burn-in, with no lingering trend — evidence the chain has
+    *converged*. The dotted red line indicates where the `burnin` period stops and the sampling begins (i.e. we throw away the `burnin` samples and keep only the subsequent estimates for our posterior distribution.)
+2.  **Posterior distributions** instead of single value for each estimated parameter, we have a distribution, which quantifies uncertainty.
+
+```{r diagnostics, eval=T}
+
+# --- Diagnostic trace plots (full chain; burn-in marked in red) ---
+par(mfrow = c(2, 1), mar=c(4.5, 4.5, 2.5, 2))
+plot(post$chain$R0,      type = "l", main = "Trace: R0", ylab = "R0")
+abline(v = 5000, col = "red", lty = 2)
+plot(post$chain$I0,      type = "l", main = "Trace: I0", ylab = "I0")
+abline(v = 5000, col = "red", lty = 2)
+
+# Posterior marginal histograms
+par(mfrow = c(1, 2))
+hist(post$posterior$R0, breaks = 40, main = "Posterior: R0", xlab = "R0",
+       xaxs="i", yaxs="i")
+hist(post$posterior$I0, breaks = 40, main = "Posterior: I0", xlab = "I0",
+       xaxs="i", yaxs="i")
+  
+```
+
+> **Stop and think.**
+> Has the Metropolis sampler run for sufficient iterations? Try running for longer (increase the `iter` argument) and compare the trace plots and posterior histograms.
+
+> **Activity.**
+> With Bayesian models, instead of confidence intervals we obtain **credible intervals**.
+> Come up with a definition for a 95% credible interval.
+> How wide is the credible interval for $R_0$?
+> What does the shape of the posterior distribution indicate about how certain we are about the parameter estimate?
+
+```{r credible-interval, eval=T}
+  print(round(post$summary, 4))
+```
+
+> How do the model estimated values for $R_0$ and $I_0$ compare with your earlier estimates from manually fitting an exponential curve?
+
+Another important considering is the **correlation** between the posterior distributions. Correlated posterior distributions for $R_0$ and $I_0$ indicate that our inference model struggles to independently identify the two parameters.
+
+```{r correlation, eval=T}
+
+# Checking the correlation between the posterior distributions
+par(mfrow = c(1, 1), mar=c(4.5, 4.5, 2.5, 2))
+plot(post$posterior$R0 ~ post$posterior$I0, type = "p", pch=1, cex=1.5, 
+     main = "Posterior correlation",
+     ylab="R0", xlab="I0", cex.lab=1.25)
+```
+
+This plot suggests that the parameters are somewhat correlated, meaning our model struggles to differentiate between a higher transmission rate $(R_0)$ versus a larger number of initial infected cases $(I_0)$.
+
+------------------------------------------------------------------------
+
+# Posterior predictive checks: forecasting the epidemic {#ppc}
+
+Now we forecast by propagating the **whole posterior** through the model, not just a single best estimate. Each posterior draw $(R_0, I_0)$ produces one trajectory; stacking them gives a range of possible futures.
+
+Crucially, we compare against the **same quantity we fitted** (daily case incidence).
+
+```{r ppc, eval=T, fig.width=8, fig.height=8.5} 
+horizon <- seq(0, 60, by = 1)   # extend beyond the observed window
+horizon_dates <- seq(T0, by = "days", length.out = 61)
+
+# One full-SEIR trajectory per posterior draw
+idx <- sample(nrow(post$posterior), 1000)
+
+# Cumulative cases (I + R) for each sampled draw -> [time x draw]
+cum_mat <- sapply(idx, function(k) {
+  fit_k <- runSEIR(list(R0 = post$posterior$R0[k],
+                        I0 = post$posterior$I0[k]),
+                   horizon)
+  fit_k$I + fit_k$R                                # cumulative cases
+})
+
+# Daily incidence = day-to-day difference of the cumulative curve.
+# Prepend 0 so the first day's incidence is measured from the start,
+# keeping the same number of rows as the cumulative matrix.
+inc_mat <- apply(cum_mat, 2, function(col) diff(c(0, col)))
+
+# --- Summarise across draws at each time point ---
+summ <- function(mat) data.frame(
+  time   = horizon,
+  median = apply(mat, 1, median),
+  lower  = apply(mat, 1, quantile, 0.025),
+  upper  = apply(mat, 1, quantile, 0.975)
+)
+
+## Cumulative cases and incidence
+cum_pred <- summ(cum_mat)
+inc_pred <- summ(inc_mat)
+
+## Figures
+par(mfrow = c(2, 1), mar=c(5.5, 5.5, 3, 2))
+## First daily incidence
+plot(horizon_dates, inc_pred$median, type = "l", lwd = 2, col = "darkorange",
+     ylim = range(0, inc_pred$upper),
+     xlab = "Day", ylab = "Incidence",
+     main = "Posterior predictive forecast | Incidence")
+polygon(c(horizon_dates, rev(horizon_dates)), c(inc_pred$lower, rev(inc_pred$upper)),
+        col = adjustcolor("darkorange", 0.2), border = NA)
+points(datasofar$date, datasofar$cases_dorms,
+       pch = 19, col = "steelblue")
+legend("topleft", c("Observed (fitted period)", "Posterior median", "95% CrI"),
+       col = c("steelblue", "darkorange", adjustcolor("darkorange", 0.4)),
+       pch = c(19, NA, 15), lwd = c(NA, 2, NA), bty = "n")
+
+## Then cumulative cases
+plot(horizon_dates, cum_pred$median, type = "l", lwd = 2, col = "darkorange",
+     ylim = range(0, cum_pred$upper),
+     xlab = "Day", ylab = "Cumulative cases",
+     main = "Posterior predictive forecast | Cumulative cases")
+polygon(c(horizon_dates, rev(horizon_dates)), c(cum_pred$lower, rev(cum_pred$upper)),
+        col = adjustcolor("darkorange", 0.2), border = NA)
+points(datasofar$date, cumsum(datasofar$cases_dorms),
+       pch = 19, col = "steelblue")
+legend("topleft", c("Observed (fitted period)", "Posterior median", "95% CrI"),
+       col = c("steelblue", "darkorange", adjustcolor("darkorange", 0.4)),
+       pch = c(19, NA, 15), lwd = c(NA, 2, NA), bty = "n")
+```
+
+> **Interpretation.** The shaded band is the range of epidemic trajectories consistent with the data *and* our model assumptions. A wide band means high forecast uncertainty in our parameters.
+
+------------------------------------------------------------------------
+
+# Confronting the forecast with new data {#newdata}
+
+> The real test of a forecast is what happens next. 
+
+By late April 2020, more data has arrived. We overlay the new case data onto our earlier
+prediction. Did reality fall within our credible interval?
+
+```{r newdata, eval=T, fig.width=8, fig.height=8.5}
+# Import new data (until the end of April 2020)
+T1 <- max(datasofar$time)
+
+d2 <- read.csv("data/data-02-endapril.csv")
+d2$time <- as.numeric(as.Date(d2$date, format="%d/%m/%Y")-T0)
+d2$date <- dmy(d2$date)
+newdata <- d2[d2$time>=T1,]
+
+## bind dataframes
+alldata <- rbind(datasofar, newdata)
+
+## Figures with new points
+par(mfrow = c(2, 1), mar=c(5.5, 5.5, 3, 2))
+## First daily incidence
+plot(horizon_dates, inc_pred$median, type = "l", lwd = 2, col = "darkorange",
+     ylim = range(0, inc_pred$upper),
+     xlab = "Day", ylab = "Incidence",
+     main = "Did the forecast hold up? | Incidence")
+polygon(c(horizon_dates, rev(horizon_dates)), c(inc_pred$lower, rev(inc_pred$upper)),
+        col = adjustcolor("darkorange", 0.2), border = NA)
+points(datasofar$date, datasofar$cases_dorms,
+       pch = 19, col = "steelblue")
+points(newdata$date, newdata$cases_dorms,
+       pch = 17, col = "red")                      # NEW, out-of-sample data
+legend("topleft",
+       c("Fitted data", "New (out-of-sample) data", "Forecast median", "95% CrI"),
+       col = c("steelblue", "red", "darkorange", adjustcolor("darkorange", 0.4)),
+       pch = c(19, 17, NA, 15), lwd = c(NA, NA, 2, NA), bty = "n")
+
+## Then cumulative cases
+plot(horizon_dates, cum_pred$median, type = "l", lwd = 2, col = "darkorange",
+     ylim = range(0, cum_pred$upper),
+     xlab = "Day", ylab = "Cumulative cases",
+     main = "Did the forecast hold up? | Cumulative cases")
+polygon(c(horizon_dates, rev(horizon_dates)), c(cum_pred$lower, rev(cum_pred$upper)),
+        col = adjustcolor("darkorange", 0.2), border = NA)
+points(datasofar$date, cumsum(datasofar$cases_dorms),
+       pch = 19, col = "steelblue")
+points(newdata$date,
+       cumsum(alldata$cases_dorms)[newdata$time + 1],
+       pch = 17, col = "red")                      # NEW, out-of-sample data
+legend("topleft",
+       c("Fitted data", "New (out-of-sample) data", "Forecast median", "95% CrI"),
+       col = c("steelblue", "red", "darkorange", adjustcolor("darkorange", 0.4)),
+       pch = c(19, 17, NA, 15), lwd = c(NA, NA, 2, NA), bty = "n")
+```
+
+It looks like the model is **not doing a good job** of forecasting the new cases!
+
+> **Stop and think.**
+> Can you brainstorm reasons **why** the model is not fitting the new data well?
+
+# Refitting with new data 
+Finally, we can **re-fit** using all the data and produce an updated forecast:
+
+```{r refit, eval=T}
+post2 <- metropolis_sampler(iter= 10000, burnin = 5000,
+                              inputdata = alldata)
+```
+
+> **Activity**
+>
+> - Plot the diagnostic MCMC plots and predicted values for the newly fitted model
+> - Proceed to do this for all future case series (check the `data` folder)
+
+```{r dir, eval=T}
+dir("data")
+```
+
+# Updating the model structure
+
+Our model might not be fitting the data well because **the transmission rate has changed**. This could be due to changes in the contact rate (fewer contacts per day between individuals), or because of a lower probability of transmission per contact (e.g. due to mask wearing or social distancing).
+
+Below we provide code for an updated SEIR model that allows for a transition between two transmission rates at a pre-selected time point (`tchange`):
+
+```{r SEIR2, eval=F}
+
+## New SEIR model
+seir2_ode <- odin({ # changes marked #!
+  # Derivatives
+  deriv(S) <- -beta * S * I
+  deriv(E) <- beta * S * I - lambda * E 
+  deriv(I) <- lambda * E  - gamma * I 
+  deriv(R) <- gamma * I 
+  
+  # Initial conditions
+  initial(S) <- N_ini - I_ini
+  initial(I) <- I_ini
+  initial(R) <- 0
+  initial(E) <- 0
+  
+  # user defined values
+  N_ini <- user()
+  I_ini <- user()
+  
+  # parameters
+  beta <- if(t < tchange) b1 else b2 #!
+  b1 <- user() #!
+  b2 <- user() #!
+  tchange <- user() #!
+  gamma <- user()
+  lambda <- user()
+})
+
+runSEIR2 = function(inputpars, timevec=NULL){ #changes marked #!
+  # inputpars is a list containing R0, I0
+  # timevec is a vector like 0, 1, ..., tmax to run it over
+  if(is.null(timevec))stop("No time window provided for model run")
+  parameters <- list(beta = NA, lambda = 0.5, gamma = 0.14, n = 323000,
+                     tchange = 40) #!
+  parameters$b1 = inputpars$R01*parameters$gamma/parameters$n #!
+  parameters$b2 = inputpars$R02*parameters$gamma/parameters$n #!
+  
+  # initialize model
+  seir_mod <- seir2_ode$new(b1 = parameters$b1, #!
+                           b2 = parameters$b2, #!
+                           tchange = parameters$tchange, #!
+                           gamma = parameters$gamma,
+                           lambda = parameters$lambda,
+                           N_ini = parameters$n,
+                           I_ini = inputpars$I0)
+  # how long to run
+  times <- timevec
+  # run the model
+  seir_out <- seir_mod$run(times)
+  return(df_sir_out <- as.data.frame(seir_out))
+}
+
+```
+
+> **Advanced Activity.**
+>
+> Can you run this updated SEIR model, and fit to case data using the Metropolis sampler?
+
+------------------------------------------------------------------------
+
+# Summary {#summary}
+
+> **Closing discussion.**
+>
+> - Real dormitory cases eventually **diverged from the initial growth rate** as interventions took effect and susceptibles were depleted.
+- How did you find forecasting over **short and long** time horizons?
+> - Is it more useful to report a *range* of futures, rather than a single
+>   "best" forecast number, to public health decision makers?
+> - What **changes** would you make to the SEIR model structure to better capture reality?
+> - Is there any additional **data** you would ideally collect?
+
+In this activity you moved from a hand-tuned exponential curve to a forecast using an SEIR model, estimating key parameters using a Bayesian framework. 
+
+Key ideas to reflect on are:
+
+- the distinction between the growth rate $r$ and reproduction number $R_0$;
+- how the Metropolis sampler uses data to generate a *distribution* of plausible parameters;
+- how to check that the sampler worked; 
+- how to propagate parameter uncertainty into a forecast; and 
+- how to validate predictions against new data. 
+
+These are the fundamental steps used in real-time epidemic modelling.
+
+# Further reading {#reading}
+
+1. Iain and Clive Tan led a [study](https://jamanetwork.com/journals/jama/fullarticle/2776190) on missed infections over the first wave, finding a majority had been infected by the time the dorms were “cleared” in August 2020.
+
+1. Hannah Clapham and colleagues have [confirmed](https://doi.org/10.1016/j.ijid.2021.11.043) that this is grossly discrepant from infection rates in the general community.
+
+1. Jin Shihui and colleagues used [statistical inference](https://doi.org/10.1016/j.epidem.2022.100617) to estimate the degree of connectivity between different parts of a dormitory through surveillance and serology.
+
+1. Huso Yi and colleagues [assessed](https://doi.org/10.1093/jtm/taaa159) where contact in the dorms was unavoidable.
